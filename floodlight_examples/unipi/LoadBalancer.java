@@ -9,6 +9,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentSkipListSet;
 
+import org.projectfloodlight.openflow.protocol.OFFlowAdd;
 import org.projectfloodlight.openflow.protocol.OFFlowMod;
 import org.projectfloodlight.openflow.protocol.OFMatchBmap;
 import org.projectfloodlight.openflow.protocol.OFMessage;
@@ -78,6 +79,9 @@ public class LoadBalancer implements IOFMessageListener, IFloodlightModule {
 	// Current Selected server
 	static int last_server = 0;
 	
+	// Counter
+	static int counter = 0;
+	
 	// Set of MacAddresses seen
 	protected Set macAddresses;
 
@@ -114,6 +118,7 @@ public class LoadBalancer implements IOFMessageListener, IFloodlightModule {
 	public Collection<Class<? extends IFloodlightService>> getModuleDependencies() {
 		Collection<Class<? extends IFloodlightService>> l = new ArrayList<Class<? extends IFloodlightService>>();
 	    l.add(IFloodlightProviderService.class);
+	    l.add(IStaticFlowEntryPusherService.class);
 	    return l;
 	}
 
@@ -121,6 +126,7 @@ public class LoadBalancer implements IOFMessageListener, IFloodlightModule {
 	public void init(FloodlightModuleContext context) throws FloodlightModuleException {
 		// TODO Auto-generated method stub
 		floodlightProvider = context.getServiceImpl(IFloodlightProviderService.class);
+		staticFlowEntryPusher = context.getServiceImpl(IStaticFlowEntryPusherService.class);
 		
 	    // Create an empty MacAddresses set
 	    macAddresses = new ConcurrentSkipListSet<Long>();
@@ -250,63 +256,73 @@ public class LoadBalancer implements IOFMessageListener, IFloodlightModule {
 		
 		// Cast the IP packet
 		IPv4 ipv4 = (IPv4) eth.getPayload();
+		
+		// Change Server
+		last_server = ( last_server + 1 ) % 2;
 
 		// Create a flow table modification message to add a rule
-		OFFlowMod.Builder fmb = sw.getOFFactory().buildFlowAdd();
+		OFFlowAdd.Builder fmb = sw.getOFFactory().buildFlowAdd();
 		
         fmb.setIdleTimeout(IDLE_TIMEOUT);
         fmb.setHardTimeout(HARD_TIMEOUT);
         fmb.setBufferId(OFBufferId.NO_BUFFER);
         fmb.setOutPort(OFPort.ANY);
-        fmb.setBufferId(pi.getBufferId());
         fmb.setCookie(U64.of(0));
         fmb.setPriority(FlowModUtils.PRIORITY_MAX);
 
+        // Create the match structure  
         Match.Builder mb = sw.getOFFactory().buildMatch();
         mb.setExact(MatchField.ETH_TYPE, EthType.IPv4)
-        .setExact(MatchField.IP_PROTO, IpProtocol.IPv4)
         .setExact(MatchField.IPV4_DST, LOAD_BALANCER_IP)
         .setExact(MatchField.ETH_DST, LOAD_BALANCER_MAC);
         
+        // Create the actions (Change DST mac and IP addresses and set the out-port)
         ArrayList<OFAction> actions = new ArrayList<OFAction>();
-        actions.add(sw.getOFFactory().actions().setDlDst(MacAddress.of(SERVERS_MAC[last_server])));
-        actions.add(sw.getOFFactory().actions().setNwDst(IPv4Address.of(SERVERS_IP[last_server])));
-        actions.add(sw.getOFFactory().actions().output(OFPort.of(SERVERS_PORT[last_server]), Integer.MAX_VALUE ));
+        actions.add(sw.getOFFactory().actions().buildSetDlDst().setDlAddr(MacAddress.of(SERVERS_MAC[last_server])).build());
+        actions.add(sw.getOFFactory().actions().buildSetNwDst().setNwAddr(IPv4Address.of(SERVERS_IP[last_server])).build());
+        actions.add(sw.getOFFactory().actions().output(OFPort.of(SERVERS_PORT[last_server]), Integer.MAX_VALUE ).createBuilder().build());
         
         fmb.setActions(actions);
         fmb.setMatch(mb.build());
 
         sw.write(fmb.build());
         
-        // Reverse
+        // In case we want to use the IStaticFlowEntryPusherService service
+        //staticFlowEntryPusher.addFlow(Integer.toString(counter), fmb.build(), sw.getId());
+        //counter++;
+        
+        // Reverse Rule to change the source address and mask the action of the controller
         
 		// Create a flow table modification message to add a rule
-		OFFlowMod.Builder fmbRev = sw.getOFFactory().buildFlowAdd();
+		OFFlowAdd.Builder fmbRev = sw.getOFFactory().buildFlowAdd();
 		
 		fmbRev.setIdleTimeout(IDLE_TIMEOUT);
 		fmbRev.setHardTimeout(HARD_TIMEOUT);
 		fmbRev.setBufferId(OFBufferId.NO_BUFFER);
-		fmbRev.setOutPort(OFPort.ANY);
-		fmbRev.setBufferId(pi.getBufferId());
+		fmbRev.setOutPort(OFPort.CONTROLLER);
 		fmbRev.setCookie(U64.of(0));
 		fmbRev.setPriority(FlowModUtils.PRIORITY_MAX);
 
         Match.Builder mbRev = sw.getOFFactory().buildMatch();
         mbRev.setExact(MatchField.ETH_TYPE, EthType.IPv4)
-        .setExact(MatchField.IP_PROTO, IpProtocol.IPv4)
         .setExact(MatchField.IPV4_SRC, IPv4Address.of(SERVERS_IP[last_server]))
         .setExact(MatchField.ETH_SRC, MacAddress.of(SERVERS_MAC[last_server]));
         
         ArrayList<OFAction> actionsRev = new ArrayList<OFAction>();
-        actionsRev.add(sw.getOFFactory().actions().setDlSrc(LOAD_BALANCER_MAC));
-        actionsRev.add(sw.getOFFactory().actions().setNwSrc(LOAD_BALANCER_IP));
-        actionsRev.add(sw.getOFFactory().actions().output(OFPort.of(1), Integer.MAX_VALUE ));
+        actionsRev.add(sw.getOFFactory().actions().buildSetDlSrc().setDlAddr(LOAD_BALANCER_MAC).build());
+        actionsRev.add(sw.getOFFactory().actions().buildSetNwSrc().setNwAddr(LOAD_BALANCER_IP).build());
+        actionsRev.add(sw.getOFFactory().actions().output(OFPort.of(1), Integer.MAX_VALUE ).createBuilder().build());
         
         fmbRev.setActions(actionsRev);
         fmbRev.setMatch(mbRev.build());
         
         sw.write(fmbRev.build());
+        
+        // In case we want to use the IStaticFlowEntryPusherService service
+        //staticFlowEntryPusher.addFlow(Integer.toString(counter), fmbRev.build(), sw.getId());
+        //counter++;
 
+        // If we do not apply the same action to the packet we have received and we send it back the first packet will be lost
         
 		// Create the Packet-Out and set basic data for it (buffer id and in port)
 		OFPacketOut.Builder pob = sw.getOFFactory().buildPacketOut();
@@ -323,11 +339,8 @@ public class LoadBalancer implements IOFMessageListener, IFloodlightModule {
             byte[] packetData = pi.getData();
             pob.setData(packetData);
             
-            System.out.printf("Data Included\n");
 		} 
-		
-		System.out.printf("Load Balancer\n");
-		
+				
 		sw.write(pob.build());
 		
 	}
